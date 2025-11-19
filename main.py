@@ -1,6 +1,8 @@
 import os
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import requests
 
 app = FastAPI()
 
@@ -12,13 +14,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 @app.get("/")
 def read_root():
     return {"message": "Hello from FastAPI Backend!"}
 
+
 @app.get("/api/hello")
 def hello():
     return {"message": "Hello from the backend API!"}
+
 
 @app.get("/test")
 def test_database():
@@ -63,6 +68,74 @@ def test_database():
     response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
     
     return response
+
+
+class AIQuery(BaseModel):
+    query: str
+    mode: str | None = None
+
+
+@app.post("/api/ai/query")
+def ai_query(payload: AIQuery):
+    """Query an AI model with provided text.
+    If OPENAI_API_KEY is set, attempts to call OpenAI Chat Completions.
+    Otherwise, returns a lightweight local heuristic response.
+    """
+    text = (payload.query or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Query text is required")
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if api_key:
+        try:
+            body = {
+                "model": "gpt-3.5-turbo",
+                "messages": [
+                    {"role": "system", "content": "You are a helpful, concise assistant."},
+                    {"role": "user", "content": text},
+                ],
+                "temperature": 0.2,
+                "max_tokens": 300,
+            }
+            r = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=body,
+                timeout=30,
+            )
+            if r.status_code >= 400:
+                raise HTTPException(status_code=502, detail=f"AI provider error: {r.text[:200]}")
+            data = r.json()
+            answer = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            return {"answer": answer.strip(), "source": "openai"}
+        except HTTPException:
+            raise
+        except Exception as e:
+            # Fallback to local heuristic on any unexpected error
+            summary = _simple_local_answer(text)
+            return {"answer": summary, "source": "local-fallback", "error": str(e)[:120]}
+    else:
+        # No API key; return a helpful local response
+        summary = _simple_local_answer(text)
+        return {"answer": summary, "source": "local"}
+
+
+def _simple_local_answer(text: str) -> str:
+    """A minimal heuristic 'AI' response when no external model is available."""
+    # Extract keywords by naive frequency (very simple)
+    import re
+    tokens = [t.lower() for t in re.findall(r"[a-zA-Z0-9']+", text) if len(t) > 2]
+    from collections import Counter
+    common = ", ".join([w for w, _ in Counter(tokens).most_common(5)]) if tokens else ""
+    return (
+        "Here's a quick take based on what you said:\n"
+        f"- Main terms: {common or 'n/a'}\n"
+        f"- Rephrased: {text[:300]}\n\n"
+        "Enable an AI key to get richer answers (set OPENAI_API_KEY)."
+    )
 
 
 if __name__ == "__main__":
